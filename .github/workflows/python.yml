@@ -4,97 +4,65 @@ on:
   create:
     tags:
       - 'v*'
+  repository_dispatch:
+    types: [wf-python]
 
 jobs:
   build:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python: [3.5, 3.6, 3.7, 3.8]
-        include:
-          - os: ubuntu-latest
-            ARCH: linux-x86_64
-            LIBFILE: 'libhyperbuild_python_lib.so'
-            PYEXT: 'so'
-          - os: windows-latest
-            ARCH: windows-x86_64
-            LIBFILE: 'hyperbuild_python_lib.dll'
-            PYEXT: 'pyd'
-          - os: macos-latest
-            ARCH: macos-x86_64
-            LIBFILE: 'libhyperbuild_python_lib.dylib'
-            PYEXT: 'so'
+        os: [macos-11.0, ubuntu-latest, windows-latest]
+        python: [3.7, 3.8, 3.9]
     steps:
       - uses: actions/checkout@v1
-      - name: Get version
-        id: version
-        shell: bash
-        run: echo ::set-output name=VERSION::${GITHUB_REF#refs/tags/v}
-      - name: Get native module file name
-        id: native_file
-        shell: bash
-        env:
-          PYTHON_VERSION: ${{ matrix.python }}
-        # PowerShell doesn't support `${...}` syntax.
-        run: echo ::set-output name=NAME::${{ matrix.ARCH }}-${PYTHON_VERSION//./_}/hyperbuild.${{ matrix.PYEXT }}
       - name: Set up Python
         uses: actions/setup-python@v1
         with:
           python-version: ${{ matrix.python }}
           architecture: 'x64'
+
       - name: Set up Rust
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: nightly-2019-07-19
+          toolchain: stable
           profile: minimal
           default: true
+
+      - name: Set up GCC (Windows)
+        if: runner.os == 'Windows'
+        run: .\.github\workflows\gcc.ps1
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: '^1.14.0'
+
+      - name: Run prebuild steps
+        shell: bash
+        run: bash ./prebuild.sh
+
       - name: Build native module
         working-directory: ./python
         run: cargo build --release
-      - uses: chrislennon/action-aws-cli@v1.1
-      - name: Upload to S3
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: us-west-2
-        # Convert dots to underscores in Python version as Python uses dots to represent import hierarchy.
-        run: aws s3 cp ./python/target/release/${{ matrix.LIBFILE }} s3://${{ secrets.AWS_S3_BUCKET }}/hyperbuild/bin/python/${{ steps.version.outputs.VERSION }}/${{ steps.native_file.outputs.NAME }}
-  package:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v1
-      - name: Get version
-        id: version
-        shell: bash
-        run: echo ::set-output name=VERSION::${GITHUB_REF#refs/tags/v}
-      - name: Set up Python
-        uses: actions/setup-python@v1
-        with:
-          python-version: '3.5'
-          architecture: 'x64'
-      - name: Install Python dependencies
-        # chrislennon/action-aws-cli@v1.1 interferes with installed Python libraries.
-        # Installing using pip seems to be more reliable when done individually.
-        run: |
-          pip install --upgrade awscli
-          pip install --upgrade wheel
-          pip install --upgrade setuptools
-          pip install --upgrade twine
+
+      - name: Install Python build tools (macOS)
+        if: runner.os == 'macOS'
+        run: sudo pip install --upgrade maturin setuptools wheel twine
+      - name: Install Python build tools (Linux, Windows)
+        if: runner.os != 'macOS'
+        run: pip install --upgrade maturin setuptools wheel twine
+
       - name: Pack and publish package
+        shell: bash
         working-directory: ./python
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: us-west-2
         run: |
           cat << 'EOF' > "$HOME/.pypirc"
           [pypi]
           username = __token__
           password = ${{ secrets.PYPI_API_TOKEN }}
           EOF
-          cp ../README.md .
-          aws s3 mv s3://${{ secrets.AWS_S3_BUCKET }}/hyperbuild/bin/python/${{ steps.version.outputs.VERSION }}/ ./hyperbuild/. --recursive
-          python setup.py sdist bdist_wheel
-          python -m twine upload dist/*
+          maturin build --release --strip -i "$(which python)"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            twine upload target/wheels/*
+          fi

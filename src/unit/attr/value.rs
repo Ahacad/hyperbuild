@@ -1,62 +1,39 @@
-use phf::{Map, phf_map};
-
+use lazy_static::lazy_static;
+use std::collections::HashMap;
 use crate::err::ProcessingResult;
-use crate::proc::checkpoint::Checkpoint;
+use crate::proc::checkpoint::WriteCheckpoint;
 use crate::proc::MatchAction::*;
 use crate::proc::MatchMode::*;
 use crate::proc::Processor;
 use crate::proc::range::ProcessorRange;
-use crate::proc::uep::UnintentionalEntityPrevention;
-use crate::spec::codepoint::{is_digit, is_whitespace};
-use crate::unit::entity::{EntityType, parse_entity};
-
-fn is_double_quote(c: u8) -> bool {
-    c == b'"'
-}
-
-fn is_single_quote(c: u8) -> bool {
-    c == b'\''
-}
-
-// Valid attribute quote characters.
-// See https://html.spec.whatwg.org/multipage/introduction.html#intro-early-example for spec.
-fn is_attr_quote(c: u8) -> bool {
-    // Backtick is not a valid quote character according to spec.
-    is_double_quote(c) || is_single_quote(c)
-}
-
-// Valid unquoted attribute value characters.
-// See https://html.spec.whatwg.org/multipage/syntax.html#unquoted for spec.
-fn is_unquoted_val_char(c: u8) -> bool {
-    !(is_whitespace(c) || c == b'"' || c == b'\'' || c == b'=' || c == b'<' || c == b'>' || c == b'`')
-}
-
-fn is_not_unquoted_val_char(c: u8) -> bool {
-    !is_unquoted_val_char(c)
-}
+use crate::proc::entity::maybe_normalise_entity;
+use crate::gen::codepoints::{DIGIT, WHITESPACE, ATTR_QUOTE, DOUBLE_QUOTE, SINGLE_QUOTE, NOT_UNQUOTED_ATTR_VAL_CHAR};
 
 fn entity_requires_semicolon(next_char: u8) -> bool {
-    is_digit(next_char) || next_char == b';'
+    DIGIT[next_char] || next_char == b';'
 }
 
 // See comment in `process_attr_value` for full description of why these intentionally do not have semicolons.
-static ENCODED: Map<u8, &'static [u8]> = phf_map! {
-    b'\'' => b"&#39",
-    b'"' => b"&#34",
-    b'>' => b"&gt",
-    // Whitespace characters as defined by spec in crate::spec::codepoint::is_whitespace.
-    b'\x09' => b"&#9",
-    b'\x0a' => b"&#10",
-    b'\x0c' => b"&#12",
-    b'\x0d' => b"&#13",
-    b'\x20' => b"&#32",
-};
+lazy_static! {
+    static ref ENCODED: HashMap<u8, &'static [u8]> = {
+        let mut m = HashMap::<u8, &'static [u8]>::new();
+        m.insert(b'\'', b"&#39");
+        m.insert(b'"', b"&#34");
+        m.insert(b'>', b"&gt");
+        // Whitespace characters as defined by spec in crate::spec::codepoint::is_whitespace.
+        m.insert(b'\x09', b"&#9");
+        m.insert(b'\x0a', b"&#10");
+        m.insert(b'\x0c', b"&#12");
+        m.insert(b'\x0d', b"&#13");
+        m.insert(b'\x20', b"&#32");
+        m
+    };
+}
 
 #[derive(Clone, Copy)]
 enum CharType {
     Start,
     End,
-    Entity(EntityType),
     // Normal needs associated character to be able to write it.
     Normal(u8),
     // Whitespace needs associated character to determine cost of encoding it.
@@ -70,13 +47,20 @@ impl CharType {
         match c {
             b'"' => CharType::DoubleQuote,
             b'\'' => CharType::SingleQuote,
-            c => if is_whitespace(c) { CharType::Whitespace(c) } else { CharType::Normal(c) },
+            c => if WHITESPACE[c] { CharType::Whitespace(c) } else { CharType::Normal(c) },
         }
     }
 
-    fn is_start_or_end(&self) -> bool {
+    fn is_start(&self) -> bool {
         match self {
-            CharType::Start | CharType::End => true,
+            CharType::Start => true,
+            _ => false,
+        }
+    }
+
+    fn is_end(&self) -> bool {
+        match self {
+            CharType::End => true,
             _ => false,
         }
     }
@@ -104,7 +88,7 @@ struct Metrics {
 
 impl Metrics {
     fn unquoted_len(&self, raw_val: &[u8]) -> usize {
-        // TODO VERIFY (including control characters and Unicode noncharacters) Browsers seem to simply consider any characters until whitespace part of an unquoted attribute value, despite the spec (and hyperbuild) having more restrictions on allowed characters.
+        // TODO VERIFY (including control characters and Unicode noncharacters) Browsers seem to simply consider any characters until whitespace part of an unquoted attribute value, despite the spec (and minify-html) having more restrictions on allowed characters.
         // Costs for encoding first and last characters if going with unquoted attribute value.
         // NOTE: Don't need to consider whitespace for either as all whitespace will be encoded and counts as part of `total_whitespace_encoded_length`.
         // Need to consider semicolon in any encoded entity in case first char is followed by semicolon or digit.
@@ -163,14 +147,14 @@ impl Metrics {
 }
 
 pub fn skip_attr_value(proc: &mut Processor) -> ProcessingResult<()> {
-    let src_delimiter = proc.m(IsPred(is_attr_quote), Discard).first(proc);
+    let src_delimiter = proc.m(IsInLookup(ATTR_QUOTE), Discard).first(proc);
     let delim_pred = match src_delimiter {
-        Some(b'"') => is_double_quote,
-        Some(b'\'') => is_single_quote,
-        None => is_not_unquoted_val_char,
+        Some(b'"') => DOUBLE_QUOTE,
+        Some(b'\'') => SINGLE_QUOTE,
+        None => NOT_UNQUOTED_ATTR_VAL_CHAR,
         _ => unreachable!(),
     };
-    proc.m(WhileNotPred(delim_pred), Discard);
+    proc.m(WhileNotInLookup(delim_pred), Discard);
     if let Some(c) = src_delimiter {
         proc.m(IsChar(c), Discard).require("attribute value closing quote")?;
     };
@@ -205,12 +189,12 @@ fn handle_whitespace_char_type(c: u8, proc: &mut Processor, metrics: &mut Metric
 // The resulting written value would have the minimum possible value length.
 // Since the actual processed value would have a length equal or greater to it (e.g. it might be quoted, or some characters might get encoded), we can then read minimum value right to left and start writing from actual processed value length (which is calculated), quoting/encoding as necessary.
 pub fn process_attr_value(proc: &mut Processor, should_collapse_and_trim_ws: bool) -> ProcessingResult<ProcessedAttrValue> {
-    let start = Checkpoint::new(proc);
-    let src_delimiter = proc.m(IsPred(is_attr_quote), Discard).first(proc);
-    let delim_pred = match src_delimiter {
-        Some(b'"') => is_double_quote,
-        Some(b'\'') => is_single_quote,
-        None => is_not_unquoted_val_char,
+    let start = WriteCheckpoint::new(proc);
+    let src_delimiter = proc.m(IsInLookup(ATTR_QUOTE), Discard).first(proc);
+    let delim_lookup = match src_delimiter {
+        Some(b'"') => DOUBLE_QUOTE,
+        Some(b'\'') => SINGLE_QUOTE,
+        None => NOT_UNQUOTED_ATTR_VAL_CHAR,
         _ => unreachable!(),
     };
 
@@ -226,20 +210,14 @@ pub fn process_attr_value(proc: &mut Processor, should_collapse_and_trim_ws: boo
     // Set to true when one or more immediately previous characters were whitespace and deferred for processing after the contiguous whitespace.
     // NOTE: Only used if `should_collapse_and_trim_ws`.
     let mut currently_in_whitespace = false;
-    // TODO Comment.
-    let uep = &mut UnintentionalEntityPrevention::new(proc, false);
 
     let mut last_char_type: CharType = CharType::Start;
     loop {
-        let char_type = if proc.m(IsPred(delim_pred), MatchOnly).nonempty() {
+        let char_type = if maybe_normalise_entity(proc) && proc.peek(0).filter(|c| delim_lookup[*c]).is_some() {
+            CharType::from_char(proc.skip()?)
+        } else if proc.m(IsInLookup(delim_lookup), MatchOnly).nonempty() {
             // DO NOT BREAK HERE. More processing is done afterwards upon reaching end.
             CharType::End
-        } else if proc.m(IsChar(b'&'), MatchOnly).nonempty() {
-            // Don't write entity here; wait until any previously ignored whitespace has been handled.
-            match parse_entity(proc)? {
-                EntityType::Ascii(c) => CharType::from_char(c),
-                entity => CharType::Entity(entity),
-            }
         } else {
             CharType::from_char(proc.skip()?)
         };
@@ -254,7 +232,7 @@ pub fn process_attr_value(proc: &mut Processor, should_collapse_and_trim_ws: boo
             // Now past whitespace (e.g. moved to non-whitespace char or end of attribute value). Either:
             // - ignore contiguous whitespace (i.e. do nothing) if we are currently at beginning or end of value; or
             // - collapse contiguous whitespace (i.e. count as one whitespace char) otherwise.
-            if currently_in_whitespace && !char_type.is_start_or_end() {
+            if currently_in_whitespace && !(last_char_type.is_start() || char_type.is_end()) {
                 // Collect current collapsed contiguous whitespace that was ignored previously.
                 // Update `last_char_type` as this space character will become the new "previous character", important later when checking if previous character as an entity requires semicolon.
                 last_char_type = CharType::Whitespace(b' ');
@@ -267,9 +245,6 @@ pub fn process_attr_value(proc: &mut Processor, should_collapse_and_trim_ws: boo
             CharType::Start => unreachable!(),
             CharType::End => {
                 break;
-            }
-            CharType::Entity(e) => {
-                e.keep(proc);
             }
             CharType::Whitespace(c) => {
                 handle_whitespace_char_type(c, proc, &mut metrics);
@@ -297,13 +272,11 @@ pub fn process_attr_value(proc: &mut Processor, should_collapse_and_trim_ws: boo
                 };
             }
         };
-        uep.update(proc);
         last_char_type = char_type;
     };
     if let Some(c) = src_delimiter {
         proc.m(IsChar(c), Discard).require("attribute value closing quote")?;
     };
-    uep.end(proc);
     let minimum_value = start.written_range(proc);
     // If minimum value is empty, return now before trying to read out of range later.
     // (Reading starts at one character before end of minimum value.)
@@ -340,8 +313,8 @@ pub fn process_attr_value(proc: &mut Processor, should_collapse_and_trim_ws: boo
         // TODO Comment is_first and is_last could both be true,
         let should_encode = match (c, optimal_delimiter, is_first, is_last) {
             (b'>', DelimiterType::Unquoted, _, true) => true,
-            (c, DelimiterType::Unquoted, true, _) => is_attr_quote(c),
-            (c, DelimiterType::Unquoted, _, _) => is_whitespace(c),
+            (c, DelimiterType::Unquoted, true, _) => ATTR_QUOTE[c],
+            (c, DelimiterType::Unquoted, _, _) => WHITESPACE[c],
             (b'\'', DelimiterType::Single, _, _) => true,
             (b'"', DelimiterType::Double, _, _) => true,
             _ => false,
@@ -353,7 +326,7 @@ pub fn process_attr_value(proc: &mut Processor, should_collapse_and_trim_ws: boo
             // Numeric entities simply need to check if the following character is a base 10 digit.
             // The last character encoded as an entity never needs a semicolon:
             // - For quoted values, it's always a quote and will never be encoded.
-            // - Unquoted attribute values are only ever followed by a space (written by hyperbuild) or the opening tag delimiter ('>').
+            // - Unquoted attribute values are only ever followed by a space (written by minify-html) or the opening tag delimiter ('>').
             // '&gt' is always safe as it's only used for any '>' as the last character of an unquoted value.
             let should_add_semicolon = !is_last && entity_requires_semicolon(optimal_slice[write + 1]);
             let encoded = ENCODED[&c];

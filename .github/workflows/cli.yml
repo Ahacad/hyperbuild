@@ -4,14 +4,20 @@ on:
   create:
     tags:
       - 'v*'
+  repository_dispatch:
+    types: [wf-cli]
 
 jobs:
   cli:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [macos-latest, ubuntu-latest, windows-latest]
         include:
+          - os: macos-latest
+            ARCH: macos-x86_64
+            MIME: application/octet-stream
+            EXT: ''
           - os: ubuntu-latest
             ARCH: linux-x86_64
             MIME: application/octet-stream
@@ -20,16 +26,12 @@ jobs:
             ARCH: windows-x86_64
             MIME: application/vnd.microsoft.portable-executable
             EXT: '.exe'
-          - os: macos-latest
-            ARCH: macos-x86_64
-            MIME: application/octet-stream
-            EXT: ''
     steps:
       - uses: actions/checkout@v1
       - name: Get version
         id: version
         shell: bash
-        run: echo ::set-output name=VERSION::${GITHUB_REF#refs/tags/v}
+        run: echo ::set-output name=VERSION::"$([[ "$GITHUB_REF" == refs/tags/v* ]] && echo ${GITHUB_REF#refs/tags/v} || echo '0.0.0')"
       - name: Get file name
         id: file
         shell: bash
@@ -37,15 +39,25 @@ jobs:
       - name: Set up Rust
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: 1.39.0
+          toolchain: stable
           profile: minimal
           default: true
+      - name: Set up GCC (Windows)
+        if: runner.os == 'Windows'
+        run: .\.github\workflows\gcc.ps1
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: '^1.14.0'
+      - name: Run prebuild steps
+        shell: bash
+        run: bash ./prebuild.sh
       - name: Build CLI
-        run: cargo build --release
-      - uses: chrislennon/action-aws-cli@v1.1
-      - name: Upload to S3
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: us-west-2
-        run: aws s3 cp ./target/release/hyperbuild${{ matrix.EXT }} s3://${{ secrets.AWS_S3_BUCKET }}/hyperbuild/bin/${{ steps.file.outputs.FILE }} --content-type ${{ matrix.MIME }}
+        working-directory: ./cli
+        run: cargo build --release -vvv
+      - name: Set up Backblaze B2 CLI
+        uses: wilsonzlin/setup-b2@v3
+      - name: Upload to B2
+        run: |
+          b2 authorize-account ${{ secrets.CICD_CLI_B2_KEY_ID }} ${{ secrets.CICD_CLI_B2_APPLICATION_KEY }}
+          b2 upload-file --contentType ${{ matrix.MIME }} ${{ secrets.CICD_CLI_B2_BUCKET_NAME }} ./cli/target/release/minify-html-cli${{ matrix.EXT }} minify-html/bin/${{ steps.file.outputs.FILE }}

@@ -4,9 +4,11 @@ set -e
 
 pushd "$(dirname "$0")"
 
-bash ../nodejs/build.sh
+pushd ../nodejs
+npm run build
+popd
 
-pushd hyperbuild-bench
+pushd minify-html-bench
 cargo build --release
 popd
 

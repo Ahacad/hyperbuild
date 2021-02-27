@@ -1,29 +1,27 @@
 [package]
-name = "hyperbuild"
-description = "Fast one-pass in-place HTML minifier written in Rust with context-aware whitespace handling"
+name = "minify-html"
+description = "Extremely fast and smart HTML + JS + CSS minifier"
 license = "MIT"
-homepage = "https://github.com/wilsonzlin/hyperbuild"
+homepage = "https://github.com/wilsonzlin/minify-html"
 readme = "README.md"
-keywords = ["html", "compress", "minifier", "minify", "minification"]
+keywords = ["html", "compress", "minifier", "js", "css"]
 categories = ["compression", "command-line-utilities", "development-tools::build-utils", "web-programming"]
-repository = "https://github.com/wilsonzlin/hyperbuild.git"
-version = "0.0.45"
+repository = "https://github.com/wilsonzlin/minify-html.git"
+version = "0.4.3"
 authors = ["Wilson Lin <code@wilsonl.in>"]
 edition = "2018"
-include = ["/gen/*.json", "/src/**/*", "/build.rs", "/Cargo.toml", "/LICENSE", "/README.md"]
+include = ["/src/**/*", "/Cargo.toml", "/LICENSE", "/README.md"]
 
 [badges]
 maintenance = { status = "actively-developed" }
 
+[features]
+default = []
+js-esbuild = ["crossbeam", "esbuild-rs"]
+
 [dependencies]
-cascade = "0.1.4"
-fastrie = "0.0.6"
-phf = { version = "0.8.0", features = ["macros"] }
-structopt = "0.3.5"
-
-[build-dependencies]
-serde = { version = "1.0.104", features = ["derive"] }
-serde_json = "1.0.44"
-
-[profile.release]
-panic = 'abort'
+aho-corasick = "0.7"
+crossbeam = { version = "0.7", optional = true }
+esbuild-rs = { version = "0.8.30", optional = true }
+lazy_static = "1.4"
+memchr = "2"

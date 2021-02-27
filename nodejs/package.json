@@ -1,17 +1,21 @@
 {
-  "name": "hyperbuild",
-  "version": "0.0.45",
-  "description": "Fast one-pass in-place HTML minifier written in Rust with context-aware whitespace handling",
-  "main": "dist/index.js",
+  "name": "@minify-html/js",
+  "version": "0.4.3",
+  "description": "Extremely fast and smart HTML + JS + CSS minifier",
+  "main": "index.node",
+  "types": "index.d.ts",
   "files": [
-    "dist/**"
+    "postinstall.js",
+    "index.d.ts"
   ],
+  "scripts": {
+    "build": "node-gyp build && shx mv build/Release/index.node index.node",
+    "clean": "cd native && cargo clean && cd .. && node-gyp clean && node-gyp configure && shx rm -f index.node",
+    "postinstall": "node postinstall.js"
+  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wilsonzlin/hyperbuild.git"
-  },
-  "engines": {
-    "node": ">=8 <=13"
+    "url": "git+https://github.com/wilsonzlin/minify-html.git"
   },
   "author": {
     "email": "npm@wilsonl.in",
@@ -20,13 +24,16 @@
   },
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/wilsonzlin/hyperbuild/issues"
+    "url": "https://github.com/wilsonzlin/minify-html/issues"
   },
-  "homepage": "https://github.com/wilsonzlin/hyperbuild#readme",
+  "engines": {
+    "node": ">= 8.6.0"
+  },
+  "homepage": "https://github.com/wilsonzlin/minify-html#readme",
   "devDependencies": {
-    "@types/node": "^13.1.8",
-    "neon-cli": "^0.3.3",
-    "typescript": "^3.7.5"
+    "@types/node": "^14.6.0",
+    "node-gyp": "^7.0.0",
+    "shx": "^0.3.2"
   },
   "keywords": [
     "build",

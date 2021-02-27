@@ -1,53 +1,49 @@
-use phf::{phf_set, Set};
-
+use lazy_static::lazy_static;
+use std::collections::HashSet;
 use crate::err::{ErrorType, ProcessingResult};
-use crate::proc::checkpoint::Checkpoint;
+use crate::proc::checkpoint::{WriteCheckpoint, ReadCheckpoint};
 use crate::proc::MatchAction::*;
 use crate::proc::MatchMode::*;
 use crate::proc::Processor;
 use crate::proc::range::ProcessorRange;
-use crate::spec::codepoint::{is_alphanumeric, is_whitespace};
-use crate::spec::tag::omission::CLOSING_TAG_OMISSION_RULES;
 use crate::spec::tag::void::VOID_TAGS;
-use crate::unit::attr::{AttributeMinification, ATTRS, AttrType, process_attr, ProcessedAttr};
+use crate::unit::attr::{AttrType, process_attr, ProcessedAttr};
 use crate::unit::content::process_content;
 use crate::unit::script::process_script;
 use crate::unit::style::process_style;
+use crate::gen::attrs::{ATTRS, AttributeMinification};
+use crate::spec::tag::ns::Namespace;
+use crate::gen::codepoints::{TAG_NAME_CHAR, WHITESPACE};
+use crate::cfg::Cfg;
+use crate::spec::tag::omission::{can_omit_as_last_node, can_omit_as_before};
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum Namespace {
-    Html,
-    Svg,
-}
-
-pub static JAVASCRIPT_MIME_TYPES: Set<&'static [u8]> = phf_set! {
-    b"application/ecmascript",
-    b"application/javascript",
-    b"application/x-ecmascript",
-    b"application/x-javascript",
-    b"text/ecmascript",
-    b"text/javascript",
-    b"text/javascript1.0",
-    b"text/javascript1.1",
-    b"text/javascript1.2",
-    b"text/javascript1.3",
-    b"text/javascript1.4",
-    b"text/javascript1.5",
-    b"text/jscript",
-    b"text/livescript",
-    b"text/x-ecmascript",
-    b"text/x-javascript",
-};
-
-// Tag names may only use ASCII alphanumerics. However, some people also use `:` and `-`.
-// See https://html.spec.whatwg.org/multipage/syntax.html#syntax-tag-name for spec.
-fn is_valid_tag_name_char(c: u8) -> bool {
-    is_alphanumeric(c) || c == b':' || c == b'-'
+lazy_static! {
+    pub static ref JAVASCRIPT_MIME_TYPES: HashSet<&'static [u8]> = {
+        let mut s = HashSet::<&'static [u8]>::new();
+        s.insert(b"application/ecmascript");
+        s.insert(b"application/javascript");
+        s.insert(b"application/x-ecmascript");
+        s.insert(b"application/x-javascript");
+        s.insert(b"text/ecmascript");
+        s.insert(b"text/javascript");
+        s.insert(b"text/javascript1.0");
+        s.insert(b"text/javascript1.1");
+        s.insert(b"text/javascript1.2");
+        s.insert(b"text/javascript1.3");
+        s.insert(b"text/javascript1.4");
+        s.insert(b"text/javascript1.5");
+        s.insert(b"text/jscript");
+        s.insert(b"text/livescript");
+        s.insert(b"text/x-ecmascript");
+        s.insert(b"text/x-javascript");
+        s
+    };
 }
 
 #[derive(Copy, Clone)]
 enum TagType {
-    Script,
+    ScriptJs,
+    ScriptData,
     Style,
     Other,
 }
@@ -56,6 +52,7 @@ enum TagType {
 pub struct MaybeClosingTag(Option<ProcessorRange>);
 
 impl MaybeClosingTag {
+    #[inline(always)]
     pub fn none() -> MaybeClosingTag {
         MaybeClosingTag(None)
     }
@@ -97,17 +94,16 @@ impl MaybeClosingTag {
 }
 
 // TODO Comment param `prev_sibling_closing_tag`.
-pub fn process_tag(proc: &mut Processor, ns: Namespace, mut prev_sibling_closing_tag: MaybeClosingTag) -> ProcessingResult<MaybeClosingTag> {
-    // Expect to be currently at an opening tag.
-    proc.m(IsChar(b'<'), Discard).expect();
-    // May not be valid tag name at current position, so require instead of expect.
-    let source_tag_name = proc.m(WhilePred(is_valid_tag_name_char), Discard).require("tag name")?;
-    if prev_sibling_closing_tag.exists_and(|prev_tag|
-        CLOSING_TAG_OMISSION_RULES
-            .get(&proc[prev_tag])
-            .filter(|rule| rule.can_omit_as_before(&proc[source_tag_name]))
-            .is_none()
-    ) {
+pub fn process_tag(
+    proc: &mut Processor,
+    cfg: &Cfg,
+    ns: Namespace,
+    parent: Option<ProcessorRange>,
+    descendant_of_pre: bool,
+    mut prev_sibling_closing_tag: MaybeClosingTag,
+    source_tag_name: ProcessorRange,
+) -> ProcessingResult<MaybeClosingTag> {
+    if prev_sibling_closing_tag.exists_and(|prev_tag| !can_omit_as_before(proc, Some(prev_tag), source_tag_name)) {
         prev_sibling_closing_tag.write(proc);
     };
     // Write initially skipped left chevron.
@@ -115,8 +111,9 @@ pub fn process_tag(proc: &mut Processor, ns: Namespace, mut prev_sibling_closing
     // Write previously skipped name and use written code as range (otherwise source code will eventually be overwritten).
     let tag_name = proc.write_range(source_tag_name);
 
-    let tag_type = match &proc[tag_name] {
-        b"script" => TagType::Script,
+    let mut tag_type = match &proc[tag_name] {
+        // Unless non-JS MIME `type` is provided, `script` tags contain JS.
+        b"script" => TagType::ScriptJs,
         b"style" => TagType::Style,
         _ => TagType::Other,
     };
@@ -127,7 +124,7 @@ pub fn process_tag(proc: &mut Processor, ns: Namespace, mut prev_sibling_closing
 
     loop {
         // At the beginning of this loop, the last parsed unit was either the tag name or an attribute (including its value, if it had one).
-        proc.m(WhilePred(is_whitespace), Discard);
+        proc.m(WhileInLookup(WHITESPACE), Discard);
 
         if proc.m(IsChar(b'>'), Keep).nonempty() {
             // End of tag.
@@ -141,7 +138,7 @@ pub fn process_tag(proc: &mut Processor, ns: Namespace, mut prev_sibling_closing
         }
 
         // Mark attribute start in case we want to erase it completely.
-        let attr_checkpoint = Checkpoint::new(proc);
+        let attr_checkpoint = WriteCheckpoint::new(proc);
         let mut erase_attr = false;
 
         // Write space after tag name or unquoted/valueless attribute.
@@ -158,13 +155,17 @@ pub fn process_tag(proc: &mut Processor, ns: Namespace, mut prev_sibling_closing
 
         let ProcessedAttr { name, typ, value } = process_attr(proc, ns, tag_name)?;
         match (tag_type, &proc[name]) {
-            (TagType::Script, b"type") => {
+            // NOTE: We don't support multiple `type` attributes, so can't go from ScriptData => ScriptJs.
+            (TagType::ScriptJs, b"type") => {
                 // It's JS if the value is empty or one of `JAVASCRIPT_MIME_TYPES`.
                 let script_tag_type_is_js = value
                     .filter(|v| !JAVASCRIPT_MIME_TYPES.contains(&proc[*v]))
                     .is_none();
                 if script_tag_type_is_js {
                     erase_attr = true;
+                } else {
+                    // Tag does not contain JS, don't minify JS.
+                    tag_type = TagType::ScriptData;
                 };
             }
             (_, name) => {
@@ -191,6 +192,10 @@ pub fn process_tag(proc: &mut Processor, ns: Namespace, mut prev_sibling_closing
             if is_void_tag {
                 proc.write_slice(b">");
             } else {
+                if let Some(AttrType::Unquoted) = last_attr_type {
+                    // Prevent `/` from being part of the value.
+                    proc.write(b' ');
+                };
                 proc.write_slice(b"/>");
             };
         };
@@ -203,20 +208,38 @@ pub fn process_tag(proc: &mut Processor, ns: Namespace, mut prev_sibling_closing
         ns
     };
 
+    let mut closing_tag_omitted = false;
     match tag_type {
-        TagType::Script => process_script(proc)?,
-        TagType::Style => process_style(proc)?,
-        _ => process_content(proc, child_ns, Some(tag_name))?,
+        TagType::ScriptData => process_script(proc, cfg, false)?,
+        TagType::ScriptJs => process_script(proc, cfg, true)?,
+        TagType::Style => process_style(proc, cfg)?,
+        _ => closing_tag_omitted = process_content(proc, cfg, child_ns, Some(tag_name), descendant_of_pre)?.closing_tag_omitted,
     };
 
-    // Require closing tag for non-void.
-    proc.m(IsSeq(b"</"), Discard).require("closing tag")?;
-    let closing_tag = proc.m(WhilePred(is_valid_tag_name_char), Discard).require("closing tag name")?;
-    // We need to check closing tag matches as otherwise when we later write closing tag, it might be longer than source closing tag and cause source to be overwritten.
-    if !proc[closing_tag].eq(&proc[tag_name]) {
-        return Err(ErrorType::ClosingTagMismatch);
+    let can_omit_closing_tag = can_omit_as_last_node(proc, parent, tag_name);
+    if closing_tag_omitted || proc.at_end() && can_omit_closing_tag {
+        return Ok(MaybeClosingTag(None));
     };
-    proc.m(WhilePred(is_whitespace), Discard);
-    proc.m(IsChar(b'>'), Discard).require("closing tag end")?;
-    Ok(MaybeClosingTag(Some(tag_name)))
+
+    let closing_tag_checkpoint = ReadCheckpoint::new(proc);
+    proc.m(IsSeq(b"</"), Discard).require("closing tag")?;
+    let closing_tag = proc.m(WhileInLookup(TAG_NAME_CHAR), Discard).require("closing tag name")?;
+    proc.make_lowercase(closing_tag);
+
+    // We need to check closing tag matches as otherwise when we later write closing tag, it might be longer than source closing tag and cause source to be overwritten.
+    if proc[closing_tag] != proc[tag_name] {
+        if can_omit_closing_tag {
+            closing_tag_checkpoint.restore(proc);
+            Ok(MaybeClosingTag(None))
+        } else {
+            Err(ErrorType::ClosingTagMismatch {
+                expected: unsafe { String::from_utf8_unchecked(proc[tag_name].to_vec()) },
+                got: unsafe { String::from_utf8_unchecked(proc[closing_tag].to_vec()) },
+            })
+        }
+    } else {
+        proc.m(WhileInLookup(WHITESPACE), Discard);
+        proc.m(IsChar(b'>'), Discard).require("closing tag end")?;
+        Ok(MaybeClosingTag(Some(tag_name)))
+    }
 }

@@ -4,42 +4,65 @@ on:
   create:
     tags:
       - 'v*'
+  repository_dispatch:
+    types: [wf-bench]
 
 jobs:
   bench:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v1
+
       - name: Get version
         id: version
         shell: bash
-        run: echo ::set-output name=VERSION::${GITHUB_REF#refs/tags/v}
-      - name: Set up Node.js
-        uses: actions/setup-node@master
-        with:
-          node-version: 10.x
+        run: echo ::set-output name=VERSION::"$([[ "$GITHUB_REF" == refs/tags/v* ]] && echo ${GITHUB_REF#refs/tags/v} || echo '0.0.0')"
+
       - name: Set up Rust
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: 1.39.0
+          toolchain: stable
           profile: minimal
           default: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: '^1.14.0'
+
+      - name: Set up Node.js for generating code
+        uses: actions/setup-node@master
+        with:
+          node-version: 14.x
+
+      - name: Run prebuild steps
+        shell: bash
+        run: bash ./prebuild.sh
+
+      - name: Set up Node.js for benching
+        uses: actions/setup-node@master
+        with:
+          node-version: 10.x
+
       - name: Set up Node.js module
         working-directory: ./nodejs
         run: npm install
+
       - name: Build bench
         working-directory: ./bench
         run: |
           sudo apt install -y build-essential libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev
           npm install
           ./build.sh
-      - name: Run bench and graph results
+
+      - name: Set up Backblaze B2 CLI
+        uses: wilsonzlin/setup-b2@v3
+
+      - name: Run bench and upload results
         working-directory: ./bench
-        run: ./bench.sh
-      - uses: chrislennon/action-aws-cli@v1.1
-      - name: Upload to S3
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: us-west-2
-        run: aws s3 cp ./bench/results/ s3://${{ secrets.AWS_S3_BUCKET }}/hyperbuild/bench/${{ steps.version.outputs.VERSION }}/ --recursive
+        run: |
+          b2 authorize-account ${{ secrets.CICD_CLI_B2_KEY_ID }} ${{ secrets.CICD_CLI_B2_APPLICATION_KEY }}
+          ./bench.sh
+          b2 sync ./results/ b2://${{ secrets.CICD_CLI_B2_BUCKET_NAME }}/minify-html/bench/${{ steps.version.outputs.VERSION }}/js/
+          HTML_ONLY=1 ./bench.sh
+          b2 sync ./results/ b2://${{ secrets.CICD_CLI_B2_BUCKET_NAME }}/minify-html/bench/${{ steps.version.outputs.VERSION }}/core/

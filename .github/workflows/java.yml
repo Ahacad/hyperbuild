@@ -4,34 +4,52 @@ on:
   create:
     tags:
       - 'v*'
+  repository_dispatch:
+    types: [wf-java]
 
 jobs:
   build:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [macos-latest, ubuntu-latest, windows-latest]
         include:
-          - os: ubuntu-latest
-            ARCH: linux-x86_64
-            FILE: 'libhyperbuild_java.so'
-          - os: windows-latest
-            ARCH: windows-x86_64
-            FILE: 'hyperbuild_java.dll'
           - os: macos-latest
             ARCH: macos-x86_64
-            FILE: 'libhyperbuild_java.dylib'
+            FILE: 'libminify_html_java.dylib'
+          - os: ubuntu-latest
+            ARCH: linux-x86_64
+            FILE: 'libminify_html_java.so'
+          - os: windows-latest
+            ARCH: windows-x86_64
+            FILE: 'minify_html_java.dll'
     steps:
       - uses: actions/checkout@v1
+
       - name: Set up Rust
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: 1.39.0
+          toolchain: stable
           profile: minimal
           default: true
+
+      - name: Set up GCC (Windows)
+        if: runner.os == 'Windows'
+        run: .\.github\workflows\gcc.ps1
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: '^1.14.0'
+
+      - name: Run prebuild steps
+        shell: bash
+        run: bash ./prebuild.sh
+
       - name: Build Java native library
         run: cargo build --release
         working-directory: ./java
+
       - name: Upload built library
         uses: actions/upload-artifact@v1
         with:
@@ -42,27 +60,32 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v1
+
       - name: Set up JDK
         uses: actions/setup-java@v1
         with:
           java-version: '1.7'
           java-package: jdk
           architecture: x64
-      - name: Download Windows built library
-        uses: actions/download-artifact@v1
-        with:
-          name: windows-x86_64
-          path: java/src/main/resources/windows-x86_64
+
       - name: Download Linux built library
         uses: actions/download-artifact@v1
         with:
           name: linux-x86_64
           path: java/src/main/resources/linux-x86_64
+
       - name: Download macOS built library
         uses: actions/download-artifact@v1
         with:
           name: macos-x86_64
           path: java/src/main/resources/macos-x86_64
+
+      - name: Download Windows built library
+        uses: actions/download-artifact@v1
+        with:
+          name: windows-x86_64
+          path: java/src/main/resources/windows-x86_64
+
       - name: Move native library files to correct location
         shell: bash
         working-directory: ./java/src/main/resources
@@ -71,6 +94,7 @@ jobs:
             mv $f/* "$f.nativelib"
             rmdir "$f"
           done
+
       - name: Build, pack, and publish JAR
         working-directory: ./java
         env:
@@ -98,4 +122,6 @@ jobs:
             </profiles>
           </settings>
           EOF
-          mvn clean deploy
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            mvn clean deploy
+          fi
